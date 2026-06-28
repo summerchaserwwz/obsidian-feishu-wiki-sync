@@ -12,3 +12,4 @@ output/
 plugins/
 CLAUDE.md
 super-dev.yaml
+.DS_Store

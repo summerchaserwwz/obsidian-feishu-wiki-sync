@@ -207,22 +207,131 @@ export class DocApi {
   }
 
   /**
+   * 调用飞书 convert API 将 Markdown 转为 Block 数组
+   *
+   * 输入参数：
+   * - content: 去除 frontmatter 后的 Markdown 正文
+   *
+   * 返回值：{ blocks, firstLevelIds }
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  async convertMarkdown(content: string): Promise<{ blocks: any[]; firstLevelIds: string[]; imageUrlMap: { block_id: string; image_url: string }[] }> {
+    const token = await this.auth.getToken();
+    await this.rateLimiter.acquire("doc");
+
+    const resp = await requestUrl({
+      url: `${API_BASE}/docx/v1/documents/blocks/convert`,
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify({
+        content_type: "markdown",
+        content,
+      }),
+      throw: false,
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const data: FeishuResponse<{ blocks?: any[]; first_level_block_ids?: string[]; block_id_to_image_urls?: { block_id: string; image_url: string }[] }> = resp.json;
+    if (data.code !== 0) {
+      throw new Error(`Markdown 转换失败 (${data.code}): ${data.msg}`);
+    }
+
+    // strip merge_info（只读字段，传入 descendant 会报错）
+    const blocks = (data.data.blocks ?? []).map((block) => {
+      if (block.block_type === 31 && block.table?.property?.merge_info) {
+        delete block.table.property.merge_info;
+      }
+      return block;
+    });
+
+    return {
+      blocks,
+      firstLevelIds: data.data.first_level_block_ids ?? [],
+      imageUrlMap: data.data.block_id_to_image_urls ?? [],
+    };
+  }
+
+  /**
+   * 通过 /descendant 接口批量写入嵌套块
+   *
+   * 输入参数：
+   * - documentId: 文档 ID
+   * - childrenId: 第一级子块的临时 ID 列表
+   * - descendants: 所有块的扁平列表
+   * - revisionId: 当前文档版本号
+   *
+   * 返回值：更新后的 revision_id
+   */
+  async createDescendantBlocks(
+    documentId: string,
+    childrenId: string[],
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    descendants: any[],
+    revisionId: number
+  ): Promise<{ temporary_block_id: string; block_id: string }[]> {
+    const token = await this.auth.getToken();
+    await this.rateLimiter.acquire("doc");
+
+    const resp = await requestUrl({
+      url: `${API_BASE}/docx/v1/documents/${documentId}/blocks/${documentId}/descendant?document_revision_id=${revisionId}`,
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify({ children_id: childrenId, descendants, index: 0 }),
+      throw: false,
+    });
+
+    const data: FeishuResponse<{ document_revision_id?: number; block_id_relations?: { temporary_block_id: string; block_id: string }[] }> = resp.json;
+    if (data.code !== 0) {
+      throw new Error(`写入嵌套块失败 (${data.code}): ${data.msg}`);
+    }
+
+    return data.data?.block_id_relations ?? [];
+  }
+
+  /**
+   * 更新图片块的 token（replace_image 操作）
+   *
+   * 输入参数：
+   * - documentId: 文档 ID
+   * - blockId: 图片块 ID
+   * - imageToken: 上传后获得的 file_token
+   */
+  async replaceImage(documentId: string, blockId: string, imageToken: string): Promise<void> {
+    const token = await this.auth.getToken();
+    await this.rateLimiter.acquire("doc");
+
+    const resp = await requestUrl({
+      url: `${API_BASE}/docx/v1/documents/${documentId}/blocks/${blockId}?document_revision_id=-1`,
+      method: "PATCH",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify({ replace_image: { token: imageToken } }),
+      throw: false,
+    });
+
+    const data: FeishuResponse = resp.json;
+    if (data.code !== 0) {
+      throw new Error(`更新图片块失败 (${data.code}): ${data.msg}`);
+    }
+  }
+
+  /**
    * 覆盖写入文档内容（先清空再写入）
    *
-   * 输入参数：
-   * - documentId: 文档 ID
-   * - blocks: 新的 Block 内容数组
-   */
-  /**
-   * 向文档写入内容
-   *
-   * 逻辑：
-   * - 如果文档没有子块（新建文档），直接 append
-   * - 如果有子块（更新），先删除再 append
+   * 使用飞书 convert API 将 Markdown 转为 Block，再通过 descendant 接口写入。
+   * 天然支持表格、列表、标题等复杂结构。
    *
    * 输入参数：
    * - documentId: 文档 ID
-   * - blocks: 新的 Block 内容数组
+   * - markdown: 去除 frontmatter 后的 Markdown 正文
    */
   async overwriteDocument(documentId: string, blocks: DocxBlock[]): Promise<void> {
     if (blocks.length === 0) return;
@@ -277,5 +386,64 @@ export class DocApi {
 
     // 写入新内容
     await this.appendBlocks(documentId, blocks, currentRevision);
+  }
+
+  /**
+   * 覆盖写入文档（Markdown 版本）
+   *
+   * 使用 convert API + descendant API，原生支持表格等复杂结构。
+   *
+   * 返回值：blockIdRelations（临时 ID → 真实 ID 映射）和转换后的 blocks
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  async overwriteDocumentFromMarkdown(documentId: string, markdown: string): Promise<{ blockIdRelations: { temporary_block_id: string; block_id: string }[]; imageUrlMap: { block_id: string; image_url: string }[] }> {
+    const doc = await this.getDocument(documentId);
+    let currentRevision = doc.revision_id;
+
+    const existingBlockIds = await this.listRootBlockIds(documentId);
+
+    if (existingBlockIds.length > 0) {
+      let deleted = false;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        await this.rateLimiter.acquire("doc");
+        const token = await this.auth.getToken();
+
+        const resp = await requestUrl({
+          url: `${API_BASE}/docx/v1/documents/${documentId}/blocks/${documentId}/children/batch_delete`,
+          method: "DELETE",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json; charset=utf-8",
+          },
+          body: JSON.stringify({
+            start_index: 0,
+            end_index: existingBlockIds.length,
+            document_revision_id: currentRevision,
+          }),
+          throw: false,
+        });
+
+        const data: FeishuResponse<{ document_revision_id?: number }> = resp.json;
+        if (data.code === 0) {
+          if (data.data?.document_revision_id) {
+            currentRevision = data.data.document_revision_id;
+          }
+          deleted = true;
+          break;
+        }
+        const freshDoc = await this.getDocument(documentId);
+        currentRevision = freshDoc.revision_id;
+      }
+
+      if (!deleted) {
+        throw new Error("清空飞书文档旧内容失败，已停止写入以避免新旧内容混合");
+      }
+    }
+
+    const { blocks, firstLevelIds, imageUrlMap } = await this.convertMarkdown(markdown);
+    if (blocks.length === 0) return { blockIdRelations: [], imageUrlMap: [] };
+
+    const blockIdRelations = await this.createDescendantBlocks(documentId, firstLevelIds, blocks, currentRevision);
+    return { blockIdRelations, imageUrlMap };
   }
 }

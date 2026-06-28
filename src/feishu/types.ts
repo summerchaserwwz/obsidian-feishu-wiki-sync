@@ -120,6 +120,26 @@ export interface ImageBlockContent {
   height?: number;
 }
 
+/** 表格属性 */
+export interface TableBlockProperty {
+  row_size: number;
+  column_size: number;
+  column_width: number[];
+  merge_info: { row_span: number; col_span: number }[];
+}
+
+/** 表格块内容（block_type: 31） */
+export interface TableBlockContent {
+  cells: string[];
+  property: TableBlockProperty;
+}
+
+/** 表格单元格内容（用于嵌套块创建） */
+export interface TableCellData {
+  id: string;
+  blocks: DocxBlock[];
+}
+
 /** 飞书文档 Block */
 export interface DocxBlock {
   block_id?: string;
@@ -140,6 +160,9 @@ export interface DocxBlock {
   quote?: TextBlockContent;          // type 15
   todo?: TextBlockContent & { style?: { done: boolean } }; // type 17
   image?: ImageBlockContent;         // type 27
+  table?: TableBlockContent;         // type 31
+  // 内部使用：表格单元格数据（不发送给飞书，仅用于构建嵌套块）
+  _tableCells?: TableCellData[];
 }
 
 /** 创建子块的请求体 */

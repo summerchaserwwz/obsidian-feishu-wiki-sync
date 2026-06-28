@@ -44,6 +44,19 @@ const BT = {
 } as const;
 
 // ════════════════════════════════════════════════════════
+//  表格解析
+// ════════════════════════════════════════════════════════
+
+/** 解析 GFM 表格行，返回每列的文本 */
+function parseTableRow(line: string): string[] {
+  return line
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split("|")
+    .map((cell) => cell.trim());
+}
+
+// ════════════════════════════════════════════════════════
 //  预处理：Obsidian 语法 → 标准 Markdown
 // ════════════════════════════════════════════════════════
 
@@ -57,7 +70,7 @@ const BT = {
  * - [[path]] → path 的最后一段
  * - ==highlight== → **highlight**
  */
-function preprocessObsidian(markdown: string): string {
+export function preprocessObsidian(markdown: string): string {
   let result = markdown;
 
   // 嵌入图片 ![[xxx.png]] ![[xxx.jpg]] 等
@@ -154,7 +167,18 @@ function parseInline(text: string): TextElement[] {
     // 链接 [text](url)
     m = remaining.match(/^\[([^\]]*)\]\(([^)]+)\)/);
     if (m) {
-      elements.push({ text_run: { content: m[1] || m[2], text_element_style: { link: { url: m[2] } } } });
+      const url = m[2];
+      // TODO: 非 http(s) 链接（如 Obsidian 相对路径）当前降级为纯文本，
+      //       后续可解析为 vault 内文件路径，查找 frontmatter 中的 feishu_wiki_node，
+      //       拼接为飞书文档链接 https://<domain>/wiki/<node_token>
+      const isValidUrl = /^(https?|mailto):/.test(url);
+      if (isValidUrl) {
+        elements.push({ text_run: { content: m[1] || url, text_element_style: { link: { url } } } });
+      } else {
+        // 飞书不支持的协议，保留显示文本和链接地址
+        const display = m[1] ? `${m[1]} (${url})` : url;
+        elements.push({ text_run: { content: display } });
+      }
       remaining = remaining.slice(m[0].length);
       continue;
     }
@@ -347,21 +371,48 @@ export function markdownToBlocks(markdown: string): ConversionResult {
     // ── 表格（GFM） ────────────────────────────
     if (trimmed.includes("|") && i + 1 < lines.length && /^\|[-: |]+\|/.test(lines[i + 1].trim())) {
       // 解析表头
-      const headerLine = trimmed;
+      const headerCells = parseTableRow(trimmed);
       i += 2; // 跳过头和分隔线
-      const tableLines = [headerLine];
+      const dataRows: string[][] = [];
       while (i < lines.length && lines[i].trim().includes("|")) {
-        tableLines.push(lines[i].trim());
+        dataRows.push(parseTableRow(lines[i].trim()));
         i++;
       }
-      // 表格用代码块渲染（飞书表格 Block 需要复杂的 table_cell 结构）
-      blocks.push({
-        block_type: BT.CODE,
-        code: {
-          elements: [{ text_run: { content: tableLines.join("\n") } }],
-          style: { language: FEISHU_CODE_LANGUAGE["plaintext"], wrap: true },
+
+      const colCount = headerCells.length;
+      const allRows = [headerCells, ...dataRows];
+      const cellIds: string[] = [];
+      const tableCells: { id: string; blocks: DocxBlock[] }[] = [];
+
+      for (let r = 0; r < allRows.length; r++) {
+        for (let c = 0; c < colCount; c++) {
+          const cellId = `tmp_cell_${blocks.length}_${r}_${c}`;
+          const cellText = allRows[r][c] || "";
+          cellIds.push(cellId);
+          tableCells.push({
+            id: cellId,
+            blocks: [{
+              block_type: BT.TEXT,
+              text: { elements: parseInline(cellText) },
+            }],
+          });
+        }
+      }
+
+      const tableBlock: DocxBlock & { _tableCells?: { id: string; blocks: DocxBlock[] }[] } = {
+        block_type: 31,
+        table: {
+          cells: cellIds,
+          property: {
+            row_size: allRows.length,
+            column_size: colCount,
+            column_width: Array(colCount).fill(100),
+            merge_info: cellIds.map(() => ({ row_span: 1, col_span: 1 })),
+          },
         },
-      });
+        _tableCells: tableCells,
+      };
+      blocks.push(tableBlock);
       continue;
     }
 

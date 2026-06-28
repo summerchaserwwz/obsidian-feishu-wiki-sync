@@ -8,10 +8,10 @@
  *
  * 流程：
  * 1. 读取文件内容，去除 frontmatter
- * 2. 转换 Markdown → 飞书 Block 数组
- * 3. 处理图片（解析路径 → 上传 Drive → 填充 token）
+ * 2. 预处理 Obsidian 语法为标准 Markdown
+ * 3. 飞书 convert API 将 Markdown 转为 Block
  * 4. 查找或创建知识库节点
- * 5. 覆盖写入文档内容
+ * 5. descendant API 覆盖写入文档内容
  * 6. 更新 frontmatter 同步元数据
  */
 
@@ -21,7 +21,7 @@ import { WikiApi } from "../feishu/wiki-api";
 import { DocApi } from "../feishu/doc-api";
 import { DriveApi } from "../feishu/drive-api";
 import { WikiNode, DocxBlock } from "../feishu/types";
-import { markdownToBlocks, stripFrontmatter } from "../converter/markdown-to-blocks";
+import { preprocessObsidian, stripFrontmatter } from "../converter/markdown-to-blocks";
 import { ImageResolver } from "../converter/image-resolver";
 import { SyncStateManager, SyncMeta } from "./sync-state";
 
@@ -64,7 +64,8 @@ export class SyncEngine {
   async syncFile(
     file: TFile,
     targetSpaceId?: string,
-    targetParentNodeToken?: string
+    targetParentNodeToken?: string,
+    syncRootPath?: string
   ): Promise<SyncResult> {
     const spaceId = targetSpaceId ?? this.settings.defaultSpaceId;
     const baseParentToken = targetParentNodeToken ?? this.settings.defaultParentNodeToken;
@@ -92,9 +93,6 @@ export class SyncEngine {
       const content = stripFrontmatter(rawContent);
       const title = file.basename;
 
-      // Markdown → Block 转换
-      const { blocks, pendingImages } = markdownToBlocks(content);
-
       // 查找或创建知识库节点（文档）
       const existingMeta = this.syncState.readSyncMeta(file);
       let node: WikiNode;
@@ -121,25 +119,25 @@ export class SyncEngine {
           has_child: false,
         };
       } else {
-        // 新建节点：先根据文件路径确保父目录节点链存在
-        const actualParentToken = await this.ensurePathNodes(
-          spaceId,
-          file.path,
-          baseParentToken
-        );
+        // 新建节点：从 syncFolder 调用时父节点已由 ensureFolderNode 解析，直接使用；
+        // 单文件同步时需要根据文件路径确保父目录节点链存在
+        const actualParentToken = syncRootPath
+          ? baseParentToken
+          : await this.ensurePathNodes(spaceId, file.path, baseParentToken);
         node = await this.wikiApi.createNode(spaceId, title, actualParentToken || undefined);
       }
 
-      // 处理图片（上传 Drive 并填充 block token）
-      const processedBlocks = await this.processImages(
-        blocks,
-        pendingImages,
-        node.obj_token,
-        file.path
-      );
+      // 预处理 Obsidian 语法 → 标准 Markdown，再用飞书 convert API 转换并写入
+      const processedContent = preprocessObsidian(content);
+      if (processedContent.trim()) {
+        const { blockIdRelations, imageUrlMap } = await this.docApi.overwriteDocumentFromMarkdown(node.obj_token, processedContent);
 
-      // 写入文档内容（覆盖）
-      await this.docApi.overwriteDocument(node.obj_token, processedBlocks);
+        // 处理图片：convert API 返回的 image block 需要单独上传素材
+        await this.processImagesAfterConvert(imageUrlMap, blockIdRelations, node.obj_token, file.path);
+      } else {
+        // 空内容：清空文档
+        await this.docApi.overwriteDocument(node.obj_token, []);
+      }
 
       // 更新 frontmatter 同步元数据
       const doc = await this.docApi.getDocument(node.obj_token);
@@ -189,19 +187,47 @@ export class SyncEngine {
   }
 
   /**
+   * 处理 convert API 返回的图片块
+   *
+   * 流程：
+   * 1. 从 imageUrlMap 获取临时 block ID 和对应的图片 URL
+   * 2. 通过 blockIdRelations 找到真实 block ID
+   * 3. 下载图片并上传到飞书（用 block ID 作 parent_node）
+   * 4. 调用 replaceImage 更新 block
+   */
+  private async processImagesAfterConvert(
+    imageUrlMap: { block_id: string; image_url: string }[],
+    blockIdRelations: { temporary_block_id: string; block_id: string }[],
+    documentId: string,
+    sourceFilePath: string
+  ): Promise<void> {
+    if (imageUrlMap.length === 0) return;
+
+    const relationMap = new Map(blockIdRelations.map((r) => [r.temporary_block_id, r.block_id]));
+
+    for (const img of imageUrlMap) {
+      const realBlockId = relationMap.get(img.block_id) ?? img.block_id;
+
+      try {
+        const fileToken = await this.imageResolver.resolveAndUpload(img.image_url, realBlockId, sourceFilePath);
+        if (fileToken) {
+          await this.docApi.replaceImage(documentId, realBlockId, fileToken);
+        }
+      } catch (err) {
+        console.warn(`[FeishuSync] 图片处理失败 "${img.image_url}":`, err);
+      }
+    }
+  }
+
+  /**
    * 根据文件的 vault 路径，确保飞书知识库中对应的文件夹节点链存在
+   *
+   * 仅用于单文件同步场景；从 syncFolder 调用时父节点已由 ensureFolderNode 解析。
    *
    * 例如 file.path = "03-KNOWLEDGE/AI/prompt.md"
    * → 确保 "03-KNOWLEDGE" 节点存在（父为 baseParentToken）
    * → 确保 "AI" 节点存在（父为 "03-KNOWLEDGE" 节点）
    * → 返回 "AI" 节点的 token 作为文档的父节点
-   *
-   * 输入参数：
-   * - spaceId: 知识空间 ID
-   * - filePath: 文件在 vault 中的完整路径
-   * - baseParentToken: 默认根节点 token
-   *
-   * 返回值：文件应该放在的父节点 token
    */
   private async ensurePathNodes(
     spaceId: string,
@@ -298,7 +324,7 @@ export class SyncEngine {
         folderNodeCache
       );
 
-      const result = await this.syncFile(file, targetSpaceId, parentNodeToken);
+      const result = await this.syncFile(file, targetSpaceId, parentNodeToken, folder.path);
       results.push(result);
     }
 
